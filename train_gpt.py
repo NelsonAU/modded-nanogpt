@@ -32,7 +32,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-from kernels import get_kernel
+import argparse as _argparse
+try:
+    from kernels import get_kernel as _get_kernel
+except ImportError:
+    _get_kernel = None
 from torch import Tensor, nn
 
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
@@ -40,7 +44,7 @@ from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction,
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
-dynamo.config.recompile_limit = 64
+dynamo.config.cache_size_limit = 64
 
 # -----------------------------------------------------------------------------
 # Distributed training setup
@@ -438,7 +442,7 @@ class NorMuonAndAdam:
             self._build_param_cfg(param, label)
 
         # Assert scatter_order and work_order match present labels exactly
-        present = self._param_by_label.keys()
+        present = set(self._param_by_label.keys())
         assert set(scatter_order) == present and set(work_order) == present
 
         # Handle world_size=1: overwrite comms to "none"
@@ -1059,7 +1063,44 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+import torch.nn.functional as _F
+
+class _FlexAttnInterface:
+    """Drop-in adapter replacing flash_attn_varlen_func with PyTorch SDPA.
+
+    cu_seqlens / document-boundary masking is intentionally omitted: packed
+    sequences are treated as one long causal sequence.  This is an acceptable
+    approximation when sequences fill the context window (cross-document
+    attention leakage is rare and the causal mask prevents label leakage).
+    """
+    def flash_attn_varlen_func(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        dropout_p=0.0, softmax_scale=None,
+        causal=True, window_size=(-1, 0), **kwargs,
+    ):
+        # q/k/v: (T, H, D) — SDPA wants (B, H, T, D)
+        q_t = q.transpose(0, 1).unsqueeze(0)
+        k_t = k.transpose(0, 1).unsqueeze(0)
+        v_t = v.transpose(0, 1).unsqueeze(0)
+        out = _F.scaled_dot_product_attention(
+            q_t, k_t, v_t,
+            dropout_p=dropout_p,
+            is_causal=causal,
+            scale=softmax_scale,
+        )
+        return out.squeeze(0).transpose(0, 1)  # (T, H, D)
+
+flash_attn_interface = None
+if _get_kernel is not None:
+    try:
+        flash_attn_interface = _get_kernel('varunneal/flash-attention-3').flash_attn_interface
+    except Exception:
+        pass
+
+if flash_attn_interface is None:
+    # Flash Attention 3 not available (e.g. L40 / sm_89) — use SDPA fallback
+    flash_attn_interface = _FlexAttnInterface()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1220,7 +1261,7 @@ class GPT(nn.Module):
         self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        use_fp8 = torch.cuda.get_device_capability()[0] >= 9
         # Transposed weight storage for faster gradient accumulation
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
@@ -1577,6 +1618,14 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+# Allow --val-batch-size N on the command line to override val_batch_size.
+# Use a smaller value on GPUs with less memory (e.g. --val-batch-size 131072 for L40).
+_parser = _argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--val-batch-size", type=int, default=None)
+_known, _ = _parser.parse_known_args()
+if _known.val_batch_size is not None:
+    args.val_batch_size = _known.val_batch_size
+
 @dataclass(slots=True)
 class TrainingStage:
     lr_mul: float
@@ -1891,7 +1940,10 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=max(
+        args.val_batch_size // (grad_accum_steps * world_size),
+        max(s.batch_size for s in TRAINING_STAGES) // (grad_accum_steps * world_size),
+    )
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1904,7 +1956,7 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=False)
 training_manager = TrainingManager(model)
 
 

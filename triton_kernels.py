@@ -1,7 +1,15 @@
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    _TMA_AVAILABLE = True
+except ImportError:
+    _TMA_AVAILABLE = False
+
+import os
+# FP8 col-major scaled_mm requires Hopper (compute capability >= 9.0)
+_USE_FP8 = torch.cuda.get_device_capability()[0] >= 9
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
@@ -468,6 +476,13 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 
 
 def linear_relu_square(a, b, aux=None):
+    if not _TMA_AVAILABLE:
+        c = a @ b.T
+        if aux is None: # forward pass
+            return c, torch.relu(c) ** 2
+        else:           # backward pass: aux is the saved raw output (pre)
+            return 2 * c * torch.relu(aux)
+
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
@@ -657,6 +672,134 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
         num_stages=2,
     )
 
+
+@triton.jit
+def fused_softcapped_entropy_fwd_kernel(
+    logits_ptr, losses_ptr, lse_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+
+    max_val = -float('inf')
+    sum_exp = 0.0
+
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
+        z = A * tl.sigmoid(val * inv_C + B_div_C)
+        z = tl.where(mask, z, -float('inf'))
+        curr_max = tl.max(z, axis=0)
+        new_max = tl.maximum(max_val, curr_max)
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+        max_val = new_max
+
+    lse = max_val + tl.log(sum_exp)
+    tl.store(lse_ptr + row_idx, lse)
+
+    total_loss = 0.0
+    for k in range(n_predict):
+        target_idx = row_idx + k
+        if target_idx < n_rows:
+            weight = tl.load(mtp_weights_ptr + k)
+            if weight > 0:
+                target = tl.load(targets_ptr + target_idx).to(tl.int32)
+                if target >= 0 and target < n_cols:
+                    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
+                    z_target = A * tl.sigmoid(val_target * inv_C + B_div_C)
+                    total_loss += weight * (lse - z_target)
+
+    tl.store(losses_ptr + row_idx, total_loss)
+
+@triton.jit
+def fused_softcapped_entropy_bwd_kernel(
+    grad_input_ptr, grad_output_ptr, lse_ptr, logits_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    grad_s,
+    BLOCK_SIZE: tl.constexpr,
+    N_PREDICT: tl.constexpr,
+    USE_FP8: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
+
+    lse = tl.load(lse_ptr + row_idx)
+    grad_loss = tl.load(grad_output_ptr + row_idx)
+
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+    inv_C_A = inv_C * A
+
+    # Preload all targets and weights before the column loop
+    S_w = 0.0
+    t0 = -1
+    t1 = -1
+    t2 = -1
+    w0 = 0.0
+    w1 = 0.0
+    w2 = 0.0
+
+    if N_PREDICT >= 1:
+        if row_idx + 0 < n_rows:
+            w0 = tl.load(mtp_weights_ptr + 0)
+            t0 = tl.load(targets_ptr + row_idx + 0).to(tl.int32)
+            S_w += w0
+
+    if N_PREDICT >= 2:
+        if row_idx + 1 < n_rows:
+            w1 = tl.load(mtp_weights_ptr + 1)
+            t1 = tl.load(targets_ptr + row_idx + 1).to(tl.int32)
+            S_w += w1
+
+    if N_PREDICT >= 3:
+        if row_idx + 2 < n_rows:
+            w2 = tl.load(mtp_weights_ptr + 2)
+            t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
+            S_w += w2
+
+    if USE_FP8:
+        inv_grad_s = 1.0 / grad_s
+        grad_scale_icA = grad_loss * inv_grad_s * inv_C_A
+    else:
+        grad_scale_icA = grad_loss * inv_C_A
+
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        u = val * inv_C + B_div_C
+        sigmoid_u = tl.sigmoid(u)
+        z = A * sigmoid_u
+        p = tl.exp(z - lse)
+
+        term1 = S_w * p
+
+        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        if N_PREDICT >= 1:
+            term2 += tl.where(cols == t0, w0, 0.0)
+        if N_PREDICT >= 2:
+            term2 += tl.where(cols == t1, w1, 0.0)
+        if N_PREDICT >= 3:
+            term2 += tl.where(cols == t2, w2, 0.0)
+
+        grad_z = term1 - term2
+        grad_x = grad_scale_icA * grad_z * sigmoid_u * (1.0 - sigmoid_u)
+        if USE_FP8:
+            grad_x = grad_x.to(tl.float8e5)
+        else:
+            grad_x = grad_x.to(tl.bfloat16)
+        tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
 CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304
@@ -894,14 +1037,15 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
-ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
-    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
-    "ce_fwd_bwd_kernel",
-    compute_capability="90",
-    cuda_include_dirs=["/usr/local/cuda/include/"],
-    nvcc_options=["-lineinfo", "--use_fast_math"],
-)
-ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+if _TMA_AVAILABLE:
+    ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
+        CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
+        "ce_fwd_bwd_kernel",
+        compute_capability="90",
+        cuda_include_dirs=["/usr/local/cuda/include/"],
+        nvcc_options=["-lineinfo", "--use_fast_math"],
+    )
+    ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(
@@ -918,6 +1062,8 @@ def ce_fwd_bwd(
     grad_s: float,
     grad_scale: float,
 ) -> None:
+    if not _USE_FP8:
+        raise RuntimeError("ce_fwd_bwd requires Hopper (sm_90+); should be unreachable when _USE_FP8=False.")
     grid = (n_rows, 1, 1)
     ce_fwd_bwd_kernel(
         grid,
@@ -930,6 +1076,30 @@ def ce_fwd_bwd(
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
+        if not _USE_FP8:
+            # BF16 fallback for GPUs without col-major FP8 _scaled_mm (e.g. L40)
+            logits = (x @ lm_head_weight).bfloat16()
+            n_rows, n_cols = logits.shape
+            if mtp_weights is None:
+                 mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+            n_predict = mtp_weights.shape[0]
+            losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+            lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+            logits = logits.contiguous()
+            targets = targets.contiguous()
+            mtp_weights = mtp_weights.contiguous()
+            grid = (n_rows,)
+            fused_softcapped_entropy_fwd_kernel[grid](
+                logits, losses, lse, targets, mtp_weights,
+                logits.stride(0), logits.stride(1),
+                n_rows, n_cols, n_predict,
+                A, B, C,
+                BLOCK_SIZE=2048,
+                num_warps=2
+            )
+            ctx.save_for_backward(targets, mtp_weights, lse, x, lm_head_weight)
+            ctx.params = (A, B, C, x_s, w_s, grad_s)
+            return losses
 
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
@@ -968,6 +1138,33 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        if not _USE_FP8:
+            targets, mtp_weights, lse, x, lm_head_weight = ctx.saved_tensors
+            A, B, C, x_s, w_s, grad_s = ctx.params
+            n_rows = x.shape[0]
+            n_cols = lm_head_weight.shape[1]  # vocab_size
+            n_predict = mtp_weights.shape[0]
+            # BF16 fallback: recompute logits here (not saved in ctx to avoid holding
+            # a ~4.7 GiB tensor).
+            logits = (x @ lm_head_weight).bfloat16().contiguous()
+            grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+            grid = (n_rows,)
+            fused_softcapped_entropy_bwd_kernel[grid](
+                grad_input, grad_output.contiguous(), lse, logits, targets, mtp_weights,
+                logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+                n_rows, n_cols, n_predict,
+                A, B, C,
+                grad_s,
+                BLOCK_SIZE=1024,
+                num_warps=4,
+                N_PREDICT=n_predict,
+                USE_FP8=False,
+            )
+            del logits  # free ~4.7 GiB before the grad matmuls
+            grad_x = grad_input @ lm_head_weight.T
+            grad_w = x.T @ grad_input
+            return grad_x.bfloat16(), None, None, grad_w, None, None, None, None
+
         logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input = ctx.saved_tensors
         A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
@@ -1003,5 +1200,5 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
-        return grad_x, None, None, grad_w, None, None, None
+        return grad_x, None, None, grad_w, None, None, None, None
 
