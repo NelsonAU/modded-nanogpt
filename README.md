@@ -10,8 +10,8 @@ Lovelace).
 Main changes:
 * When Flash Attention 3 is unavailable, fall back to pure PyTorch
   scaled-dot-product-attention (SDPA).
-* Add BF16 Triton kernels as fallbacks for kernels that assume FP8, TMA, and/or
-  sm90 inline assembly.
+* Add a mix of pure PyTorch fallbacks and BF16 Triton kernels in place of
+  kernels that assume FP8, TMA, and/or sm90 inline assembly.
 * Add --val-batch-size CLI argument to support lower VRAM usage.
 
 Note: only `train_gpt.py` has been ported, not `train_gpt_medium.py`.
