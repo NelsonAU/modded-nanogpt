@@ -13,6 +13,9 @@ Main changes:
 * Add a mix of pure PyTorch fallbacks and BF16 Triton kernels in place of
   kernels that assume FP8, TMA, and/or sm90 inline assembly.
 * Add --val-batch-size CLI argument to support lower VRAM usage.
+* Add periodic live text generation during training validation passes and
+  countdown ETA to the next validation check. Configurable via
+  `--generate-every`, `--num-gen-samples`, `--gen-temperature`, etc.
 
 Note: only `train_gpt.py` has been ported, not `train_gpt_medium.py`.
 
