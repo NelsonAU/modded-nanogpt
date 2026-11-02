@@ -40,6 +40,7 @@ except ImportError:
 from torch import Tensor, nn
 
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from generation import _GEN_PROMPTS, print_samples
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -1404,6 +1405,11 @@ class GPT(nn.Module):
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
             loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+        elif target_seq is None:
+            # Generation mode: return raw logits for all positions, shape (1, T, vocab_size)
+            logits = self.lm_head(x)
+            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+            return logits.float()
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1613,6 +1619,12 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
+    # text generation during training (pedagogical console output)
+    generate_every: int = 10   # generate sample text every N steps; 0 = disabled
+    num_gen_samples: int = 3   # number of prompts to generate from
+    gen_max_new_tokens: int = 100  # tokens to generate per sample
+    gen_temperature: float = 0.8   # sampling temperature (<1 = more focused, >1 = more random)
+    gen_top_k: int = 40            # top-k sampling (0 = disabled)
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -1959,7 +1971,6 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False)
 training_manager = TrainingManager(model)
 
-
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -2004,6 +2015,21 @@ train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].b
 
 gc.collect()
 
+# Uncompiled model for generation (avoids recompilation per new sequence length)
+_raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+# Lazily load the GPT-2 tokenizer once (for generation prompts)
+if master_process and args.generate_every > 0:
+    import tiktoken as _tiktoken
+    _enc = _tiktoken.get_encoding("gpt2")
+    # Encode the generation prompts once; each begins with BOS
+    _gen_prompt_ids = [
+        [BOS_ID] + _enc.encode(p) for p in _GEN_PROMPTS[:args.num_gen_samples]
+    ]
+else:
+    _enc = None
+    _gen_prompt_ids = []
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -2033,6 +2059,12 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        # --------------- GENERATION SECTION -----------------
+        if master_process and args.generate_every > 0 and (step % args.generate_every == 0):
+            print_samples(_raw_model, training_manager.get_forward_args(), _gen_prompt_ids, _enc,
+                          step, train_steps, max_new_tokens=args.gen_max_new_tokens,
+                          temperature=args.gen_temperature, top_k=args.gen_top_k,
+                          device=device, get_bigram_hash=get_bigram_hash, print0=print0)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2058,7 +2090,10 @@ for step in range(train_steps + 1):
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    step_avg_ms = approx_training_time_ms / (step + 1)
+    next_val = ((step // args.val_loss_every) + 1) * args.val_loss_every if args.val_loss_every > 0 else train_steps
+    eta_val_s = max(0, (next_val - step - 1) * step_avg_ms / 1000)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms eta_val:{eta_val_s:.0f}s", console=True)
 
 if args.run_evals:
     model.eval()

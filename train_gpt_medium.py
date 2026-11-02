@@ -1798,7 +1798,10 @@ for step in range(train_steps + 1):
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    step_avg_ms = approx_training_time_ms / (step + 1)
+    next_val = ((step // args.val_loss_every) + 1) * args.val_loss_every if args.val_loss_every > 0 else train_steps
+    eta_val_s = max(0, (next_val - step - 1) * step_avg_ms / 1000)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms eta_val:{eta_val_s:.0f}s", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
