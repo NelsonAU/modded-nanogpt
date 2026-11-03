@@ -15,10 +15,11 @@ idea of how generation improves during training.
 
 Since my fork, upstream has doubled down even more on speedrunning
 *specifically* the setting of 8xH100 GPUs, so I have not continued to track
-upstream commits. However I do still think `modded-nanogpt` as of sometime in
+upstream commits. But I do still think `modded-nanogpt` as of sometime in
 mid-2026 was a good starting point for this kind of demo, because many of its
-architectural modernizations over the original GPT-2 (rotary embeddings, ReLU²,
-Muon optimizer, skip embeddings, etc.) are more broadly useful.
+architectural modernizations over the original GPT-2 and over Karpathy's
+[nanoGPT](https://github.com/karpathy/nanoGPT/) (rotary embeddings, ReLU², Muon
+optimizer, skip connections, etc.) are more broadly useful.
 
 Main changes:
 * When Flash Attention 3 is unavailable, fall back to pure PyTorch
