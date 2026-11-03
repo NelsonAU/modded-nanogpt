@@ -1971,21 +1971,13 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False)
 training_manager = TrainingManager(model)
 
-########################################
-#            Warmup kernels            #
-########################################
-print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
+# Compile initial forward/backward graphs, then reset model and optimizer to clean initial state
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
 val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
-transition_steps = training_manager.get_transition_steps()
-# first and last pair of steps in each transition
-warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
-print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-for step in warmup_steps:
+for step in [0, 1]:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
@@ -2001,7 +1993,7 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-print0("Resetting Model", console=True)
+
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
