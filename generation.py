@@ -7,7 +7,7 @@ Usage pattern (mirrors evals/hellaswag.py):
     _enc = tiktoken.get_encoding("gpt2")
     _gen_prompt_ids = [[BOS_ID] + _enc.encode(p) for p in _GEN_PROMPTS[:n]]
     # inside validation block
-    if step % generate_every == 0:
+    if master_process and args.num_gen_samples > 0:
         print_samples(_raw_model, forward_args, _gen_prompt_ids, _enc,
                       step, train_steps, max_new_tokens=..., temperature=..., top_k=...,
                       device=device, get_bigram_hash=get_bigram_hash, print0=print0)

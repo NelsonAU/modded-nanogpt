@@ -23,6 +23,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import triton
 import numpy as np
+from tqdm import tqdm
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
@@ -1926,11 +1927,15 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+_pbar = None
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
-                print(s)
+                if _pbar is not None:
+                    tqdm.write(str(s))
+                else:
+                    print(s)
             print(s, file=f)
 
 # begin by printing this file (the Python code)
@@ -2029,6 +2034,8 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
+_last_val_loss = None
+_pbar = tqdm(total=train_steps, desc="Training", dynamic_ncols=True) if master_process else None
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -2051,6 +2058,7 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        _last_val_loss = val_loss.item()
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         # --------------- GENERATION SECTION -----------------
         if master_process and args.num_gen_samples > 0:
@@ -2086,7 +2094,19 @@ for step in range(train_steps + 1):
     step_avg_ms = approx_training_time_ms / (step + 1)
     next_val = ((step // args.val_loss_every) + 1) * args.val_loss_every if args.val_loss_every > 0 else train_steps
     eta_val_s = max(0, (next_val - step - 1) * step_avg_ms / 1000)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms eta_val:{eta_val_s:.0f}s", console=True)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms eta_val:{eta_val_s:.0f}s", console=False)
+    if _pbar is not None:
+        _pbar.update(1)
+        postfix = {"step_ms": f"{step_avg_ms:.0f}"}
+        if _last_val_loss is not None:
+            postfix["val_loss"] = f"{_last_val_loss:.4f}"
+        if args.val_loss_every > 0:
+            postfix["eta_val"] = f"{eta_val_s:.0f}s"
+        _pbar.set_postfix(postfix)
+
+if _pbar is not None:
+    _pbar.close()
+    _pbar = None
 
 if args.run_evals:
     model.eval()
