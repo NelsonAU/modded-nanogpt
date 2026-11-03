@@ -1616,12 +1616,11 @@ class Hyperparameters:
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 25   # every how many steps to evaluate val loss and generate samples? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # text generation during training (pedagogical console output)
-    generate_every: int = 10   # generate sample text every N steps; 0 = disabled
-    num_gen_samples: int = 3   # number of prompts to generate from
+    num_gen_samples: int = 3   # number of prompts to generate from (0 = disabled)
     gen_max_new_tokens: int = 100  # tokens to generate per sample
     gen_temperature: float = 0.8   # sampling temperature (<1 = more focused, >1 = more random)
     gen_top_k: int = 40            # top-k sampling (0 = disabled)
@@ -1630,13 +1629,15 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
-# Allow --val-batch-size N on the command line to override val_batch_size.
-# Use a smaller value on GPUs with less memory (e.g. --val-batch-size 131072 for L40).
+# Allow CLI overrides for val_batch_size and validation/sampling frequency.
 _parser = _argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--val-batch-size", type=int, default=None)
+_parser.add_argument("--val-loss-every", type=int, default=None)
 _known, _ = _parser.parse_known_args()
 if _known.val_batch_size is not None:
     args.val_batch_size = _known.val_batch_size
+if _known.val_loss_every is not None:
+    args.val_loss_every = _known.val_loss_every
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -2011,7 +2012,7 @@ gc.collect()
 _raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
 # Lazily load the GPT-2 tokenizer once (for generation prompts)
-if master_process and args.generate_every > 0:
+if master_process and args.num_gen_samples > 0:
     import tiktoken as _tiktoken
     _enc = _tiktoken.get_encoding("gpt2")
     # Encode the generation prompts once; each begins with BOS
@@ -2052,7 +2053,7 @@ for step in range(train_steps + 1):
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         # --------------- GENERATION SECTION -----------------
-        if master_process and args.generate_every > 0 and (step % args.generate_every == 0):
+        if master_process and args.num_gen_samples > 0:
             print_samples(_raw_model, training_manager.get_forward_args(), _gen_prompt_ids, _enc,
                           step, train_steps, max_new_tokens=args.gen_max_new_tokens,
                           temperature=args.gen_temperature, top_k=args.gen_top_k,
