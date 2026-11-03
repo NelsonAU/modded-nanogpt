@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
-    _TMA_AVAILABLE = True
+    _TMA_AVAILABLE = torch.cuda.get_device_capability()[0] >= 9
 except ImportError:
     _TMA_AVAILABLE = False
 
