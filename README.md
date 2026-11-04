@@ -26,7 +26,8 @@ Main changes:
   scaled-dot-product-attention (SDPA).
 * Add a mix of pure PyTorch fallbacks and BF16 Triton kernels in place of
   kernels that assume FP8, TMA, and/or sm90 inline assembly.
-* Add `--val-batch-size` CLI argument to support lower VRAM usage.
+* Choose validation batch size based on GPU vRAM (upstream setting was only
+  suitable for 80GB+ cards).
 * Add sample text generation during training validation passes and
   countdown ETA to the next validation check.
 

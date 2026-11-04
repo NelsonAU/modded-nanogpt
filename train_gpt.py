@@ -1626,15 +1626,27 @@ class Hyperparameters:
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
-args = Hyperparameters()
+def auto_val_batch_size(device: torch.device) -> int:
+    """Automatically choose validation batch size based on available GPU VRAM."""
+    if not torch.cuda.is_available():
+        return 512 * 1024
+    total_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    if total_mem_gb >= 70:
+        return 2 * 1024 * 1024  # upstream default
+    elif total_mem_gb >= 35:
+        return 512 * 1024
+    elif total_mem_gb >= 20:
+        return 256 * 1024
+    else:
+        return 128 * 1024
 
-# Allow CLI overrides for val_batch_size and validation/sampling frequency.
+args = Hyperparameters()
+args.val_batch_size = auto_val_batch_size(device)
+
+# Allow CLI override for validation/sampling frequency.
 _parser = _argparse.ArgumentParser(add_help=False)
-_parser.add_argument("--val-batch-size", type=int, default=None)
 _parser.add_argument("--val-loss-every", type=int, default=None)
 _known, _ = _parser.parse_known_args()
-if _known.val_batch_size is not None:
-    args.val_batch_size = _known.val_batch_size
 if _known.val_loss_every is not None:
     args.val_loss_every = _known.val_loss_every
 
@@ -1949,6 +1961,7 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+print0(f"Validation batch size: {args.val_batch_size:,} tokens (sequence length per GPU: {args.val_batch_size // (grad_accum_steps * world_size):,})")
 
 model: nn.Module = GPT(
     vocab_size=50257,
