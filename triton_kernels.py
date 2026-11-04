@@ -1,15 +1,34 @@
+import os
+from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
+
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
-    _TMA_AVAILABLE = torch.cuda.get_device_capability()[0] >= 9
 except ImportError:
-    _TMA_AVAILABLE = False
+    TensorDescriptor = None
 
-import os
-# FP8 col-major scaled_mm requires Hopper (compute capability >= 9.0)
-_USE_FP8 = torch.cuda.get_device_capability()[0] >= 9
+@lru_cache(maxsize=1)
+def has_tma_support() -> bool:
+    if not torch.cuda.is_available() or TensorDescriptor is None:
+        return False
+    try:
+        return torch.cuda.get_device_capability()[0] >= 9
+    except RuntimeError:
+        return False
+
+# Note: While compute capability 8.9 (Ada Lovelace) cards do support FP8, we
+# also need column-major FP8 _scaled_mm and the ce_fwd_bwd kernel, which is
+# only available on >= 9.0 (Hopper).
+@lru_cache(maxsize=1)
+def use_fp8() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability()[0] >= 9
+    except RuntimeError:
+        return False
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
@@ -476,7 +495,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 
 
 def linear_relu_square(a, b, aux=None):
-    if not _TMA_AVAILABLE:
+    if not has_tma_support():
         c = a @ b.T
         if aux is None: # forward pass
             return c, torch.relu(c) ** 2
@@ -494,7 +513,7 @@ def linear_relu_square(a, b, aux=None):
         FORWARD = True
         aux = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
@@ -1037,15 +1056,20 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
-if _TMA_AVAILABLE:
-    ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
-        CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
-        "ce_fwd_bwd_kernel",
-        compute_capability="90",
-        cuda_include_dirs=["/usr/local/cuda/include/"],
-        nvcc_options=["-lineinfo", "--use_fast_math"],
-    )
-    ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+_ce_fwd_bwd_kernel = None
+
+def get_ce_fwd_bwd_kernel():
+    global _ce_fwd_bwd_kernel
+    if _ce_fwd_bwd_kernel is None:
+        _ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
+            CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
+            "ce_fwd_bwd_kernel",
+            compute_capability="90",
+            cuda_include_dirs=["/usr/local/cuda/include/"],
+            nvcc_options=["-lineinfo", "--use_fast_math"],
+        )
+        _ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+    return _ce_fwd_bwd_kernel
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(
@@ -1062,10 +1086,11 @@ def ce_fwd_bwd(
     grad_s: float,
     grad_scale: float,
 ) -> None:
-    if not _USE_FP8:
-        raise RuntimeError("ce_fwd_bwd requires Hopper (sm_90+); should be unreachable when _USE_FP8=False.")
+    if not use_fp8():
+        raise RuntimeError("ce_fwd_bwd requires Hopper (sm_90+); should be unreachable when use_fp8() is False.")
+    kernel = get_ce_fwd_bwd_kernel()
     grid = (n_rows, 1, 1)
-    ce_fwd_bwd_kernel(
+    kernel(
         grid,
         (CE_KERNEL_BLOCK_SIZE, 1, 1),
         (logits, targets, mtp_weights, losses, grad_input,
@@ -1076,7 +1101,7 @@ def ce_fwd_bwd(
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
-        if not _USE_FP8:
+        if not use_fp8():
             # BF16 fallback for GPUs without col-major FP8 _scaled_mm (e.g. L40)
             logits = (x @ lm_head_weight).bfloat16()
             n_rows, n_cols = logits.shape
@@ -1138,7 +1163,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        if not _USE_FP8:
+        if not use_fp8():
             targets, mtp_weights, lse, x, lm_head_weight = ctx.saved_tensors
             A, B, C, x_s, w_s, grad_s = ctx.params
             n_rows = x.shape[0]

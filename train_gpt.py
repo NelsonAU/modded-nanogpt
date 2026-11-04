@@ -25,9 +25,6 @@ import triton
 import numpy as np
 from tqdm import tqdm
 
-torch.empty(
-    1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
-).backward()  # prevents a bug on some systems
 import torch._dynamo as dynamo
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -40,7 +37,7 @@ except ImportError:
     _get_kernel = None
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, use_fp8
 from generation import _GEN_PROMPTS, print_samples
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
@@ -50,14 +47,16 @@ dynamo.config.cache_size_limit = 64
 
 # -----------------------------------------------------------------------------
 # Distributed training setup
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
+rank = int(os.environ.get("RANK", 0))
+world_size = int(os.environ.get("WORLD_SIZE", 1))
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
 grad_accum_steps = 8 // world_size
 grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
-assert torch.cuda.is_available()
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+assert torch.cuda.is_available(), "CUDA is required for training"
+device = torch.device("cuda", local_rank)
 torch.cuda.set_device(device)
+torch.empty(1, device=device, requires_grad=True).backward()  # prevents a bug on some systems
 dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
@@ -1263,9 +1262,8 @@ class GPT(nn.Module):
         self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        use_fp8 = torch.cuda.get_device_capability()[0] >= 9
         # Transposed weight storage for faster gradient accumulation
-        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
+        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8(), x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
