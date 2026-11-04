@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
+import warnings
+warnings.filterwarnings("ignore", message=r".*functools\.lru_cache.*")
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -2007,6 +2009,8 @@ if master_process and args.num_gen_samples > 0:
 else:
     _enc = None
     _gen_prompt_ids = []
+
+print0("Compiling model and starting training...", console=True)
 
 training_time_ms = 0
 # start the clock
