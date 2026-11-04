@@ -22,13 +22,14 @@ architectural modernizations over the original GPT-2 and over Karpathy's
 optimizer, skip connections, etc.) are more broadly useful.
 
 Main changes:
+* Add live progress: periodically generates sample text to show qualitative
+  progress, as well as running quick intermediate validation to show
+  quantitative progress.
 * When Flash Attention 3 is unavailable, fall back to pure PyTorch
   scaled-dot-product-attention (SDPA).
 * Add a mix of pure PyTorch fallbacks and BF16 Triton kernels in place of
   kernels that assume FP8, TMA, and/or sm90 inline assembly.
 * Choose validation batch size based on GPU vRAM (upstream setting was only
   suitable for 80GB+ cards).
-* Add sample text generation during training validation passes and
-  countdown ETA to the next validation check.
 
 Note: only `train_gpt.py` has been ported, not `train_gpt_medium.py`.
