@@ -1988,41 +1988,10 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False)
 training_manager = TrainingManager(model)
 
-# Compile initial forward/backward graphs, then reset model and optimizer to clean initial state
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
-val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-
-for step in [0, 1]:
-    training_manager.advance_schedule(step)
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-    model.train()
-    for idx in range(grad_accum_steps):
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
-        training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
-        training_manager.sparse_index_share(step)
-        loss.backward()
-        del loss
-    training_manager.step_optimizers(step)
-
-model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-training_manager.reset(initial_state["optimizer"])
-del val_loader, train_loader, initial_state
-model.train()
-
 ########################################
 #        Training and validation       #
 ########################################
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
-
-gc.collect()
 
 # Uncompiled model for generation (avoids recompilation per new sequence length)
 _raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -2102,9 +2071,15 @@ for step in range(train_steps + 1):
         del loss
     training_manager.step_optimizers(step)
 
+    if step == 0:
+        # Reset timer after initial step compilation so JIT compile time doesn't skew training metrics
+        torch.cuda.synchronize()
+        training_time_ms = 0
+        t0 = time.perf_counter()
+
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    step_avg_ms = approx_training_time_ms / (step + 1)
+    step_avg_ms = approx_training_time_ms / max(step, 1)
     next_val = ((step // args.val_loss_every) + 1) * args.val_loss_every if args.val_loss_every > 0 else train_steps
     eta_val_s = max(0, (next_val - step - 1) * step_avg_ms / 1000)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms eta_val:{eta_val_s:.0f}s", console=False)
