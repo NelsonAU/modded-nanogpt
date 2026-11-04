@@ -58,7 +58,8 @@ def generate_text(raw_model: nn.Module, forward_args, prompt_ids: list[int], *,
 
         # target_seq=None triggers generation mode → returns logits (1, T_padded, vocab_size)
         logits = raw_model(input_seq, None, seqlens, bigram_gpu, forward_args)
-        next_logits = logits[0, real_len - 1, :].float()  # logit at last *real* position
+        # Vocab is padded to 50304 (nearest multiple of 128); slice to real GPT-2 vocab (50257)
+        next_logits = logits[0, real_len - 1, :enc.n_vocab].float()
 
         next_logits = next_logits / max(temperature, 1e-8)
         if top_k > 0:
@@ -70,8 +71,8 @@ def generate_text(raw_model: nn.Module, forward_args, prompt_ids: list[int], *,
         if next_token == BOS_ID:  # EOS / document boundary → stop
             break
 
-    # Decode, stripping BOS/pad tokens
-    decode_ids = [t for t in tokens if t != BOS_ID]
+    # Decode, stripping BOS/pad/out-of-vocab tokens
+    decode_ids = [t for t in tokens if t != BOS_ID and t < enc.n_vocab]
     return enc.decode(decode_ids)
 
 
