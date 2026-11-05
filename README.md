@@ -31,5 +31,3 @@ Main changes:
   kernels that assume FP8, TMA, and/or sm90 inline assembly.
 * Choose validation batch size based on GPU vRAM (upstream setting was only
   suitable for 80GB+ cards).
-
-Note: only `train_gpt.py` has been ported, not `train_gpt_medium.py`.
