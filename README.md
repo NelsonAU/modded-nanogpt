@@ -14,10 +14,11 @@ sample generated text as the training run progresses, to give a qualitative
 idea of how generation improves during training.
 
 Since my fork, upstream has doubled down even more on speedrunning
-*specifically* the setting of 8xH100 GPUs, so I have not continued to track
-upstream commits. But I do still think `modded-nanogpt` as of sometime in
-mid-2026 was a good starting point for this kind of demo, because many of its
-architectural modernizations over the original GPT-2 and over Karpathy's
+*specifically* the setting of 8xH100 GPUs, so I have not kept tracking it, but
+have cherry-picked a handful of upstream changes for bugfixes/modernization.
+I do still think `modded-nanogpt` as of sometime in mid-2026 was a good
+starting point for this kind of demo, because many of its architectural
+modernizations over the original GPT-2 and over Karpathy's
 [nanoGPT](https://github.com/karpathy/nanoGPT/) (rotary embeddings, ReLU², Muon
 optimizer, skip connections, etc.) are more broadly useful.
 
