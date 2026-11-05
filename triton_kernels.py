@@ -747,10 +747,8 @@ def fused_softcapped_entropy_bwd_kernel(
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
-    grad_s,
     BLOCK_SIZE: tl.constexpr,
     N_PREDICT: tl.constexpr,
-    USE_FP8: tl.constexpr,
 ):
     row_idx = tl.program_id(0).to(tl.int64)
 
@@ -794,11 +792,7 @@ def fused_softcapped_entropy_bwd_kernel(
             t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
             S_w += w2
 
-    if USE_FP8:
-        inv_grad_s = tl.cast(1.0 / grad_s, tl.float32)
-        grad_scale_icA = grad_loss * inv_grad_s * inv_C_A
-    else:
-        grad_scale_icA = grad_loss * inv_C_A
+    grad_scale_icA = grad_loss * inv_C_A
 
     zero_f32 = tl.cast(0.0, tl.float32)
     one_f32 = tl.cast(1.0, tl.float32)
@@ -824,10 +818,7 @@ def fused_softcapped_entropy_bwd_kernel(
 
         grad_z = term1 - term2
         grad_x = grad_scale_icA * grad_z * sigmoid_u * (one_f32 - sigmoid_u)
-        if USE_FP8:
-            grad_x = grad_x.to(tl.float8e5)
-        else:
-            grad_x = grad_x.to(tl.bfloat16)
+        grad_x = grad_x.to(tl.bfloat16)
         tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
 CE_KERNEL_BLOCK_SIZE = 256
@@ -1191,11 +1182,9 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
                 logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
                 n_rows, n_cols, n_predict,
                 A, B, C,
-                grad_s,
                 BLOCK_SIZE=1024,
                 num_warps=4,
                 N_PREDICT=n_predict,
-                USE_FP8=False,
             )
             del logits  # free ~4.7 GiB before the grad matmuls
             grad_x = grad_input @ lm_head_weight.T
