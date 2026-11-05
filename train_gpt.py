@@ -40,7 +40,7 @@ except ImportError:
     _get_kernel = None
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy, use_fp8
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 from generation import _GEN_PROMPTS, print_samples
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
@@ -63,104 +63,6 @@ torch.empty(1, device=device, requires_grad=True).backward()  # prevents a bug o
 dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
-
-# -----------------------------------------------------------------------------
-# Custom operators: FP8 matmul by @YouJiacheng
-# Transposed layout by @ChrisJMcCormick allows for faster gradient accumulation.
-
-@torch.library.custom_op("nanogpt::mm_t", mutates_args=())
-def mm_t_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    """Computes y = x @ w with F8 weights stored as (in_features, out_features)."""
-    @torch.compile
-    def impl(x: Tensor, w: Tensor):
-        assert x.is_contiguous() and w.is_contiguous()
-        assert x.shape[1] == w.shape[0]  # x: (batch, in), w: (in, out)
-
-        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
-
-        # _scaled_mm requires column-major B. w_f8 is row-major (in, out).
-        # .T.contiguous().T creates a column-major view without changing logical shape.
-        w_f8_col_major = w_f8.T.contiguous().T
-
-        out = torch._scaled_mm(
-            x_f8,
-            w_f8_col_major,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
-        return out, x_f8, w_f8
-
-    return impl(x, w)
-
-@mm_t_op.register_fake
-def _(x: Tensor, w: Tensor, *_):
-    assert x.ndim == w.ndim == 2
-    assert x.shape[1] == w.shape[0]
-    assert x.device == w.device
-    assert x.is_contiguous() and w.is_contiguous()
-    return x @ w, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
-
-@torch.library.custom_op("nanogpt::mm_t_backward", mutates_args=())
-def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-        assert grad.is_contiguous()
-
-        x_scale = grad.new_tensor(x_s, dtype=torch.float32)
-        w_scale = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_scale = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
-
-        # grad_x = grad @ w.T
-        grad_x = torch._scaled_mm(
-            grad_f8,
-            w_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_scale,
-            scale_b=w_scale,
-            use_fast_accum=False,
-        )
-
-        # grad_w = x.T @ grad
-        # Result is (in, out), naturally matching weight storage. No final .T needed.
-        grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
-            out_dtype=torch.float32,
-            scale_a=x_scale,
-            scale_b=grad_scale,
-            use_fast_accum=False,
-        )
-
-        return grad_x, grad_w
-
-    grad_x, grad_w = impl(g, x_f8, w_f8)
-
-    return grad_x, grad_w
-
-@mm_t_backward_op.register_fake
-def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
-
-def backward_t(ctx, grad_out: Tensor, *_):
-    x_f8, w_f8 = ctx.saved_tensors
-    x_s, w_s, grad_s = ctx.scales
-    grad_x, grad_w = torch.ops.nanogpt.mm_t_backward(
-        grad_out, x_f8, w_f8, x_s, w_s, grad_s
-    )
-    return grad_x, grad_w, None, None, None
-
-def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
-    *_, x_s, w_s, grad_s = inputs
-    _, x_f8, w_f8 = output
-    ctx.save_for_backward(x_f8, w_f8)
-    ctx.scales = x_s, w_s, grad_s
-    ctx.set_materialize_grads(False)
-
-mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
 # Polar Express
@@ -959,11 +861,10 @@ class CastedLinearT(nn.Module):
     Linear layer with transposed weight storage (in_features, out_features) which
     addresses the slow kernel that was used for gradient accumulation. @chrisjmccormick
     """
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+    def __init__(self, in_features: int, out_features: int, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
@@ -976,12 +877,7 @@ class CastedLinearT(nn.Module):
             nn.init.zeros_(self.weight) # @Grad62304977 and others
 
     def forward(self, x: Tensor):
-        if self.use_fp8 and self.training:
-            _x = x.flatten(0, -2)
-            out = torch.ops.nanogpt.mm_t(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
-            return out.reshape(*x.shape[:-1], -1)
-        else:
-            return x @ self.weight.type_as(x)
+        return x @ self.weight.type_as(x)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1286,7 +1182,7 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         # Transposed weight storage for faster gradient accumulation
-        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8(), x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
+        self.lm_head = CastedLinearT(model_dim, self.vocab_size, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 
