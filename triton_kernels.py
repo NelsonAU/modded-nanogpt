@@ -1061,11 +1061,13 @@ _ce_fwd_bwd_kernel = None
 def get_ce_fwd_bwd_kernel():
     global _ce_fwd_bwd_kernel
     if _ce_fwd_bwd_kernel is None:
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        cuda_include_dirs = [os.path.join(cuda_home, "include")] if cuda_home else ["/usr/local/cuda/include/"]
         _ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
             CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
             "ce_fwd_bwd_kernel",
             compute_capability="90",
-            cuda_include_dirs=["/usr/local/cuda/include/"],
+            cuda_include_dirs=cuda_include_dirs,
             nvcc_options=["-lineinfo", "--use_fast_math"],
         )
         _ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
