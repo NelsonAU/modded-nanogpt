@@ -20,6 +20,7 @@ from pathlib import Path
 import gc
 import warnings
 warnings.filterwarnings("ignore", message=r".*functools\.lru_cache.*")
+warnings.filterwarnings("ignore", message=r".*flex_attention called without torch\.compile.*")
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -1066,30 +1067,50 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
 
-import torch.nn.functional as _F
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask as _create_block_mask
 
 class _FlexAttnInterface:
-    """Drop-in adapter replacing flash_attn_varlen_func with PyTorch SDPA.
+    """Drop-in adapter replacing flash_attn_varlen_func with PyTorch flex_attention.
 
-    cu_seqlens / document-boundary masking is intentionally omitted: packed
-    sequences are treated as one long causal sequence.  This is an acceptable
-    approximation when sequences fill the context window (cross-document
-    attention leakage is rare and the causal mask prevents label leakage).
+    Uses sliding-window block masking to match the non-fallback path's
+    sliding-window pattern.
     """
+    def __init__(self):
+        self._mask_cache = {}
+
+    def _get_block_mask(self, T: int, win: int | None, device: torch.device):
+        key = (T, win, device)
+        if key not in self._mask_cache:
+            if win is not None and win > 0 and win < T:
+                def mask_mod(b, h, q_idx, kv_idx):
+                    return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= win)
+            else:
+                def mask_mod(b, h, q_idx, kv_idx):
+                    return q_idx >= kv_idx
+
+            self._mask_cache[key] = _create_block_mask(
+                mask_mod, B=None, H=None, Q_LEN=T, KV_LEN=T, device=device
+            )
+        return self._mask_cache[key]
+
     def flash_attn_varlen_func(
-        self, q, k, v, cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k,
+        self, q, k, v, cu_seqlens_q=None, cu_seqlens_k=None,
+        max_seqlen_q=None, max_seqlen_k=None,
         dropout_p=0.0, softmax_scale=None,
         causal=True, window_size=(-1, 0), **kwargs,
     ):
-        # q/k/v: (T, H, D) — SDPA wants (B, H, T, D)
+        T = q.shape[0]
+        # (T, H, D) -> (1, H, T, D) for flex_attention
         q_t = q.transpose(0, 1).unsqueeze(0)
         k_t = k.transpose(0, 1).unsqueeze(0)
         v_t = v.transpose(0, 1).unsqueeze(0)
-        out = _F.scaled_dot_product_attention(
+
+        win = window_size[0] if isinstance(window_size, (tuple, list)) else window_size
+        block_mask = self._get_block_mask(T, win, q.device)
+
+        out = _flex_attention(
             q_t, k_t, v_t,
-            dropout_p=dropout_p,
-            is_causal=causal,
+            block_mask=block_mask,
             scale=softmax_scale,
         )
         return out.squeeze(0).transpose(0, 1)  # (T, H, D)
@@ -1102,7 +1123,7 @@ if _get_kernel is not None:
         pass
 
 if flash_attn_interface is None:
-    # Flash Attention 3 not available (e.g. L40 / sm_89) — use SDPA fallback
+    # Flash Attention 3 not available (e.g. L40 / sm_89) — use flex_attention fallback
     flash_attn_interface = _FlexAttnInterface()
 
 class CausalSelfAttention(nn.Module):
@@ -2066,6 +2087,8 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    if step == 0 and _pbar is not None:
+        _pbar.set_description("Compiling (first run)")
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
@@ -2080,6 +2103,8 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms = 0
         t0 = time.perf_counter()
+        if _pbar is not None:
+            _pbar.set_description("Training")
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
