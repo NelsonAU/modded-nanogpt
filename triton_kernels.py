@@ -703,18 +703,22 @@ def fused_softcapped_entropy_fwd_kernel(
     row_idx = tl.program_id(0).to(tl.int64)
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
 
-    max_val = -float('inf')
-    sum_exp = 0.0
+    neg_inf = tl.cast(-float('inf'), tl.float32)
+    max_val = neg_inf
+    sum_exp = tl.cast(0.0, tl.float32)
 
-    inv_C = 1.0 / C
-    B_div_C = B * inv_C
+    A_f32 = tl.cast(A, tl.float32)
+    B_f32 = tl.cast(B, tl.float32)
+    C_f32 = tl.cast(C, tl.float32)
+    inv_C = 1.0 / C_f32
+    B_div_C = B_f32 * inv_C
 
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
-        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
-        z = A * tl.sigmoid(val * inv_C + B_div_C)
-        z = tl.where(mask, z, -float('inf'))
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=neg_inf).to(tl.float32)
+        z = A_f32 * tl.sigmoid(val * inv_C + B_div_C)
+        z = tl.where(mask, z, neg_inf)
         curr_max = tl.max(z, axis=0)
         new_max = tl.maximum(max_val, curr_max)
         sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
@@ -723,16 +727,16 @@ def fused_softcapped_entropy_fwd_kernel(
     lse = max_val + tl.log(sum_exp)
     tl.store(lse_ptr + row_idx, lse)
 
-    total_loss = 0.0
+    total_loss = tl.cast(0.0, tl.float32)
     for k in range(n_predict):
         target_idx = row_idx + k
         if target_idx < n_rows:
-            weight = tl.load(mtp_weights_ptr + k)
+            weight = tl.load(mtp_weights_ptr + k).to(tl.float32)
             if weight > 0:
                 target = tl.load(targets_ptr + target_idx).to(tl.int32)
                 if target >= 0 and target < n_cols:
                     val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    z_target = A * tl.sigmoid(val_target * inv_C + B_div_C)
+                    z_target = A_f32 * tl.sigmoid(val_target * inv_C + B_div_C)
                     total_loss += weight * (lse - z_target)
 
     tl.store(losses_ptr + row_idx, total_loss)
@@ -753,67 +757,73 @@ def fused_softcapped_entropy_bwd_kernel(
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
     grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
 
-    lse = tl.load(lse_ptr + row_idx)
-    grad_loss = tl.load(grad_output_ptr + row_idx)
+    lse = tl.load(lse_ptr + row_idx).to(tl.float32)
+    grad_loss = tl.load(grad_output_ptr + row_idx).to(tl.float32)
 
-    inv_C = 1.0 / C
-    B_div_C = B * inv_C
-    inv_C_A = inv_C * A
+    A_f32 = tl.cast(A, tl.float32)
+    B_f32 = tl.cast(B, tl.float32)
+    C_f32 = tl.cast(C, tl.float32)
+    inv_C = 1.0 / C_f32
+    B_div_C = B_f32 * inv_C
+    inv_C_A = inv_C * A_f32
 
     # Preload all targets and weights before the column loop
-    S_w = 0.0
+    S_w = tl.cast(0.0, tl.float32)
     t0 = -1
     t1 = -1
     t2 = -1
-    w0 = 0.0
-    w1 = 0.0
-    w2 = 0.0
+    w0 = tl.cast(0.0, tl.float32)
+    w1 = tl.cast(0.0, tl.float32)
+    w2 = tl.cast(0.0, tl.float32)
 
     if N_PREDICT >= 1:
         if row_idx + 0 < n_rows:
-            w0 = tl.load(mtp_weights_ptr + 0)
+            w0 = tl.load(mtp_weights_ptr + 0).to(tl.float32)
             t0 = tl.load(targets_ptr + row_idx + 0).to(tl.int32)
             S_w += w0
 
     if N_PREDICT >= 2:
         if row_idx + 1 < n_rows:
-            w1 = tl.load(mtp_weights_ptr + 1)
+            w1 = tl.load(mtp_weights_ptr + 1).to(tl.float32)
             t1 = tl.load(targets_ptr + row_idx + 1).to(tl.int32)
             S_w += w1
 
     if N_PREDICT >= 3:
         if row_idx + 2 < n_rows:
-            w2 = tl.load(mtp_weights_ptr + 2)
+            w2 = tl.load(mtp_weights_ptr + 2).to(tl.float32)
             t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
             S_w += w2
 
     if USE_FP8:
-        inv_grad_s = 1.0 / grad_s
+        inv_grad_s = tl.cast(1.0 / grad_s, tl.float32)
         grad_scale_icA = grad_loss * inv_grad_s * inv_C_A
     else:
         grad_scale_icA = grad_loss * inv_C_A
 
+    zero_f32 = tl.cast(0.0, tl.float32)
+    one_f32 = tl.cast(1.0, tl.float32)
+
     for off in range(0, n_cols, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
-        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=zero_f32).to(tl.float32)
         u = val * inv_C + B_div_C
         sigmoid_u = tl.sigmoid(u)
-        z = A * sigmoid_u
+        z = A_f32 * sigmoid_u
         p = tl.exp(z - lse)
 
         term1 = S_w * p
 
         term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         if N_PREDICT >= 1:
-            term2 += tl.where(cols == t0, w0, 0.0)
+            term2 += tl.where(cols == t0, w0, zero_f32)
         if N_PREDICT >= 2:
-            term2 += tl.where(cols == t1, w1, 0.0)
+            term2 += tl.where(cols == t1, w1, zero_f32)
         if N_PREDICT >= 3:
-            term2 += tl.where(cols == t2, w2, 0.0)
+            term2 += tl.where(cols == t2, w2, zero_f32)
 
         grad_z = term1 - term2
-        grad_x = grad_scale_icA * grad_z * sigmoid_u * (1.0 - sigmoid_u)
+        grad_x = grad_scale_icA * grad_z * sigmoid_u * (one_f32 - sigmoid_u)
         if USE_FP8:
             grad_x = grad_x.to(tl.float8e5)
         else:

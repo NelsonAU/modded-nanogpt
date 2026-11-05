@@ -46,7 +46,7 @@ from generation import _GEN_PROMPTS, print_samples
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
-dynamo.config.cache_size_limit = 64
+dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
 # Distributed training setup
@@ -1978,6 +1978,7 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"Attention backend: {'flex_attention' if isinstance(flash_attn_interface, _FlexAttnInterface) else 'FlashAttention-3'}", console=True)
 
 def nvidia_smi():
     import subprocess  # avoid top level import
