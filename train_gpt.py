@@ -1118,7 +1118,7 @@ class _FlexAttnInterface:
 flash_attn_interface = None
 if _get_kernel is not None:
     try:
-        flash_attn_interface = _get_kernel('varunneal/flash-attention-3').flash_attn_interface
+        flash_attn_interface = _get_kernel('kernels-community/flash-attn3', version=1).flash_attn_interface
     except Exception:
         pass
 
