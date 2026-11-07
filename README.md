@@ -32,3 +32,5 @@ Main changes:
   kernels that assume FP8, TMA, and/or sm90 inline assembly.
 * Choose validation batch size based on GPU vRAM (upstream setting was only
   suitable for 80GB+ cards).
+* Scale gradient accumulation steps based on GPU vRAM, which lets us support
+  24GB GPUs (e.g. RTX 3090/4090).

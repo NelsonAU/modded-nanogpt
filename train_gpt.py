@@ -1559,6 +1559,26 @@ def auto_val_batch_size(device: torch.device) -> int:
     else:
         return 128 * 1024
 
+def auto_grad_accum_steps(batch_size: int, world_size: int, device: torch.device) -> int:
+    """Calculate gradient accumulation steps dynamically based on GPU VRAM.
+
+    Ensures tokens per forward/backward microbatch never exceeds 16,384 on 24GB GPUs
+    (e.g. RTX 3090, RTX 4090) while keeping standard full microbatches on 48GB/80GB cards.
+    """
+    base_accum = 8 // world_size
+    tokens_per_rank = batch_size // world_size
+    if not torch.cuda.is_available():
+        return base_accum
+    total_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    if total_mem_gb >= 35:
+        return base_accum
+    microbatch_target = 16384
+    accum = math.ceil(tokens_per_rank / microbatch_target)
+    accum = max(base_accum, accum)
+    while tokens_per_rank % accum != 0:
+        accum += 1
+    return accum
+
 args = Hyperparameters()
 args.val_batch_size = auto_val_batch_size(device)
 
@@ -1764,8 +1784,11 @@ class TrainingManager():
 
         new_batch_size = stage.batch_size
         new_train_max_seq_len = stage.train_max_seq_len
-        if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
-            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
+        new_grad_accum_steps = auto_grad_accum_steps(new_batch_size, world_size, device)
+        if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len or new_grad_accum_steps != self.grad_accum_steps:
+            self.grad_accum_steps = new_grad_accum_steps
+            self.grad_scale = 1.0 / new_grad_accum_steps
+            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, self.grad_accum_steps)
             self.batch_size = new_batch_size
             self.train_max_seq_len = new_train_max_seq_len
         else:
@@ -1803,6 +1826,9 @@ class TrainingManager():
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
+        self.grad_accum_steps = auto_grad_accum_steps(stage.batch_size, world_size, device)
+        self.grad_scale = 1.0 / self.grad_accum_steps
+        self.train_loader_send_args = None
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
@@ -1891,7 +1917,7 @@ model: nn.Module = GPT(
     model_dim=768,
     max_seq_len=max(
         args.val_batch_size // (grad_accum_steps * world_size),
-        max(s.batch_size for s in TRAINING_STAGES) // (grad_accum_steps * world_size),
+        max(s.batch_size // (world_size * auto_grad_accum_steps(s.batch_size, world_size, device)) for s in TRAINING_STAGES),
     )
 ).cuda()
 for m in model.modules():
@@ -1911,7 +1937,7 @@ training_manager = TrainingManager(model)
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=training_manager.grad_accum_steps)
 
 # Uncompiled model for generation (avoids recompilation per new sequence length)
 _raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -1986,10 +2012,12 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     if step == 0 and _pbar is not None:
         _pbar.set_description("Compiling (first run)")
-    for idx in range(grad_accum_steps):
+    step_accum = training_manager.grad_accum_steps
+    step_scale = training_manager.grad_scale
+    for idx in range(step_accum):
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * step_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
