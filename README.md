@@ -16,11 +16,11 @@ can do it in 90 seconds on that hardware, surely we can do it within an hour on
 cheaper hardware, fast enough for a single-class-period demo? Which did turn
 out to be the case.
 
-The main change of this fork is that it only requires CUDA compute capability
->=8.0 (Ampere or newer), while upstream requires >=9.0 (Hopper). Upstream also
-implicitly assumed ample vRAM in several places where it's not really necessary
-(H100s have 80GB), and this port scales that to allow common 24GB consumer
-cards like the 3090 and 4090 to run it.
+The main change of this fork is that it only requires CUDA compute
+capability >=8.0 (Ampere or newer), while upstream requires >=9.0 (Hopper).
+Upstream also implicitly assumed ample vRAM in several places where it's not
+really necessary (H100s have 80GB), and this port scales that to allow common
+24GB consumer cards like the 3090 and 4090 to run it.
 
 I've also added some niceties for the purpose of class demos, like periodically
 sampling text from the model as the training run progresses, to give a
