@@ -46,12 +46,34 @@ Main changes from upstream:
 * Add live progress: periodically generates sample text to show qualitative
   progress, along with intermediate validation loss calculation for
   quantitative progress.
-* When Flash Attention 3 is unavailable (everything but Ampere and Hopper
-  datacenter cards), fall back to PyTorch flex_attention with sliding-window
-  block masking.
-* Add a mix of pure PyTorch fallbacks and BF16 Triton kernels in place of
-  kernels that assume FP8, TMA, and/or sm90 inline assembly.
-* Choose validation batch size based on GPU VRAM (upstream setting was only
+* When Flash Attention 3 is unavailable, fall back to PyTorch flex_attention
+  with sliding-window block masking.
+* For Ampere and Ada Lovelace architectures, add a mix of pure PyTorch
+  fallbacks and BF16 Triton kernels in place of kernels that assume FP8, TMA,
+  and/or sm90 inline assembly.
+* Choose validation batch size based on GPU VRAM (upstream setting is only
   suitable for 80GB+ cards).
 * Scale gradient accumulation steps based on GPU VRAM, which lets us support
   24GB GPUs (e.g. RTX 3090/4090).
+
+## Tested cards
+
+This has been tested to run on the following cards, with training-only timings
+as follows. The 8xH100 timing is the upstream speedrun; the rest are my tests
+as of November 2026. The tested set spans consumer, workstation, and datacenter
+cards from the Ampere, Ada Lovelace, and Hopper architectures.
+
+* 8xH100: 1.5 minutes
+* 4xA100-SXM4: 10 minutes
+* 1xH200: 12 minutes
+* 4xL40: 18 minutes
+* 1xA100-SXM4: 32 minutes
+* 1xGeForce RTX 4090: 50 minutes (70 minutes with flex_attention fallback)
+* 1xL40: 66 minutes
+* 1xA40: 69 minutes
+
+Total wall-clock time for a classroom demo will be a bit longer due to time
+needed for the intermediate text generation. How much longer depends on how
+frequently you sample (default is every 25 training steps) and on what
+hardware. As approximate timings, it adds ~2-10 seconds per sample set. With
+the default every-25-steps sampling frequency, this adds ~2-10 minutes total.
