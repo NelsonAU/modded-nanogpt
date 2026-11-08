@@ -16,11 +16,10 @@ can do it in 90 seconds on that hardware, surely we can do it within an hour on
 cheaper hardware, fast enough for a single-class-period demo? Which did turn
 out to be the case.
 
-The main change of this fork is that it only requires CUDA compute
-capability >=8.0 (Ampere or newer), while upstream requires ==9.0 (Hopper).
-Upstream also implicitly assumes ample VRAM in several places where it's not
-really necessary (H100s have 80GB), and this port scales that to allow common
-24GB consumer cards like the 3090 and 4090 to run it.
+The two main changes in this fork to support a broader range of hardware are:
+1) only require CUDA compute capability >=8.0, aka Ampere or newer (upstream
+requires ==9.0 aka Hopper), and 2) scale down VRAM to as low as 12GB if needed
+(upstream requires ~55GB).
 
 I've also added some niceties for the purpose of class demos, like periodically
 sampling text from the model as the training run progresses, to give a
@@ -54,7 +53,7 @@ Main changes from upstream:
 * Choose validation batch size based on GPU VRAM (upstream setting is only
   suitable for 80GB+ cards).
 * Scale gradient accumulation steps based on GPU VRAM, which lets us support
-  24GB GPUs (e.g. RTX 3090/4090).
+  GPUs with as little as 12GB of VRAM.
 
 ## Tested cards
 

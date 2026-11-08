@@ -1350,7 +1350,7 @@ def _load_data_shard(file: Path):
     return tokens
 
 BOS_ID = 50256
-TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 49152: 128}
+TRAIN_MAX_NUM_DOCS = {8192: 64, 16384: 64, 32768: 96, 49152: 128}
 
 class Shard:
     def __init__(self, tokens: Tensor, world_size: int = 1):
@@ -1576,14 +1576,17 @@ def auto_val_batch_size(device: torch.device) -> int:
         return 512 * 1024
     elif total_mem_gb >= 20:
         return 256 * 1024
-    else:
+    elif total_mem_gb >= 15:
         return 128 * 1024
+    else:
+        return 64 * 1024
 
 def auto_grad_accum_steps(batch_size: int, world_size: int, device: torch.device) -> int:
     """Calculate gradient accumulation steps dynamically based on GPU VRAM.
 
     Ensures tokens per forward/backward microbatch never exceeds 16,384 on 24GB GPUs
-    (e.g. RTX 3090, RTX 4090) while keeping standard full microbatches on 48GB/80GB cards.
+    (e.g. RTX 3090, RTX 4090) and 8,192 on 12GB GPUs,
+    while keeping standard full microbatches on 48GB/80GB cards.
     """
     base_accum = 8 // world_size
     tokens_per_rank = batch_size // world_size
@@ -1592,7 +1595,10 @@ def auto_grad_accum_steps(batch_size: int, world_size: int, device: torch.device
     total_mem_gb = get_device_vram_gb(device)
     if total_mem_gb >= 35:
         return base_accum
-    microbatch_target = 16384
+    elif total_mem_gb >= 15:
+        microbatch_target = 16384
+    else:
+        microbatch_target = 8192
     accum = math.ceil(tokens_per_rank / microbatch_target)
     accum = max(base_accum, accum)
     while tokens_per_rank % accum != 0:
