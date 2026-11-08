@@ -1545,11 +1545,31 @@ class Hyperparameters:
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
+args = Hyperparameters()
+
+# Allow CLI overrides.
+_parser = _argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--val-loss-every", type=int, default=None)
+_parser.add_argument("--vram-limit-gb", type=float, default=None)
+_known, _ = _parser.parse_known_args()
+if _known.val_loss_every is not None:
+    args.val_loss_every = _known.val_loss_every
+if _known.vram_limit_gb is not None and torch.cuda.is_available():
+    actual_mem = torch.cuda.get_device_properties(device).total_memory
+    torch.cuda.set_per_process_memory_fraction(min(1.0, (_known.vram_limit_gb * (1024**3)) / actual_mem), device)
+
+def get_device_vram_gb(device: torch.device) -> float:
+    if _known.vram_limit_gb is not None:
+        return _known.vram_limit_gb
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(device).total_memory / (1024**3)
+
 def auto_val_batch_size(device: torch.device) -> int:
     """Automatically choose validation batch size based on available GPU VRAM."""
     if not torch.cuda.is_available():
         return 512 * 1024
-    total_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    total_mem_gb = get_device_vram_gb(device)
     if total_mem_gb >= 70:
         return 2 * 1024 * 1024  # upstream default
     elif total_mem_gb >= 35:
@@ -1569,7 +1589,7 @@ def auto_grad_accum_steps(batch_size: int, world_size: int, device: torch.device
     tokens_per_rank = batch_size // world_size
     if not torch.cuda.is_available():
         return base_accum
-    total_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    total_mem_gb = get_device_vram_gb(device)
     if total_mem_gb >= 35:
         return base_accum
     microbatch_target = 16384
@@ -1579,15 +1599,7 @@ def auto_grad_accum_steps(batch_size: int, world_size: int, device: torch.device
         accum += 1
     return accum
 
-args = Hyperparameters()
 args.val_batch_size = auto_val_batch_size(device)
-
-# Allow CLI override for validation/sampling frequency.
-_parser = _argparse.ArgumentParser(add_help=False)
-_parser.add_argument("--val-loss-every", type=int, default=None)
-_known, _ = _parser.parse_known_args()
-if _known.val_loss_every is not None:
-    args.val_loss_every = _known.val_loss_every
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -1907,6 +1919,8 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+if _known.vram_limit_gb is not None:
+    print0(f"VRAM limit set to: {_known.vram_limit_gb:.1f} GB")
 print0(f"Validation batch size: {args.val_batch_size:,} tokens (sequence length per GPU: {args.val_batch_size // (grad_accum_steps * world_size):,})")
 
 model: nn.Module = GPT(
