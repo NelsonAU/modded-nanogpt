@@ -17,9 +17,10 @@ cheaper hardware, fast enough for a single-class-period demo? Which did turn
 out to be the case.
 
 The two main changes in this fork to support a broader range of hardware are:
-1) only require CUDA compute capability >=8.0, aka Ampere or newer (upstream
-requires ==9.0 aka Hopper), and 2) scale down VRAM to as low as 12GB if needed
-(upstream requires ~55GB).
+
+1. Only require CUDA compute capability >=8.0, aka Ampere or newer (upstream
+requires ==9.0 aka Hopper).
+2. Scale down VRAM to as low as 12GB if needed (upstream requires ~55GB).
 
 I've also added some niceties for the purpose of class demos, like periodically
 sampling text from the model as the training run progresses, to give a
