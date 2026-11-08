@@ -17,7 +17,7 @@ cheaper hardware, fast enough for a single-class-period demo? Which did turn
 out to be the case.
 
 The main change of this fork is that it only requires CUDA compute
-capability >=8.0 (Ampere or newer), while upstream requires >=9.0 (Hopper).
+capability >=8.0 (Ampere or newer), while upstream requires ==9.0 (Hopper).
 Upstream also implicitly assumes ample VRAM in several places where it's not
 really necessary (H100s have 80GB), and this port scales that to allow common
 24GB consumer cards like the 3090 and 4090 to run it.
@@ -60,8 +60,7 @@ Main changes from upstream:
 
 This has been tested to run on the following cards, with training-only timings
 as follows. The 8xH100 timing is the upstream speedrun; the rest are my tests
-as of November 2026. The tested set spans consumer, workstation, and datacenter
-cards from the Ampere, Ada Lovelace, and Hopper architectures.
+done in November 2026.
 
 * 8xH100: 1.5 minutes
 * 4xA100-SXM4: 10 minutes
@@ -71,6 +70,7 @@ cards from the Ampere, Ada Lovelace, and Hopper architectures.
 * 1xGeForce RTX 4090: 50 minutes (70 minutes with flex_attention fallback)
 * 1xL40: 66 minutes
 * 1xA40: 69 minutes
+* 1xGeForce RTX 3090: 94 minutes
 
 Total wall-clock time for a classroom demo will be a bit longer due to time
 needed for the intermediate text generation. How much longer depends on how
@@ -78,8 +78,16 @@ frequently you sample (default is every 25 training steps) and on what
 hardware. As approximate timings, it adds ~2-10 seconds per sample set. With
 the default every-25-steps sampling frequency, this adds ~2-10 minutes total.
 
+<i>Thanks to the <a href="https://www.american.edu/cas/hpc/">American
+University HPC system</a>, the <a href="https://nrp.ai/">National Research
+Platform</a>, and <a href="https://docs.ncsa.illinois.edu/systems/delta/">NCSA
+Delta</a> (via <a href="https://access-ci.org/">NSF ACCESS</a>) for the GPU
+time.</i>
+
 ## Validation plot
 
-A sanity check that all the different paths (upstream sm90 assembly, my fallbacks, etc.) on various hardware all produce the same result, albeit at different speeds:
+A sanity check that all the different paths (upstream sm90 assembly, my
+fallbacks, etc.) on various hardware all produce the same result, albeit at
+different speeds:
 
 <img width="3000" height="1800" alt="val_loss_vs_steps" src="https://github.com/user-attachments/assets/66fc0454-b03e-4a8c-afbc-55e472d12c52" />
