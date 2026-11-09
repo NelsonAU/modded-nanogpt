@@ -81,8 +81,12 @@ the default every-25-steps sampling frequency, this adds ~2-10 minutes total.
 <i>Thanks to the <a href="https://www.american.edu/cas/hpc/">American
 University HPC system</a>, the <a href="https://nrp.ai/">National Research
 Platform</a>, and <a href="https://docs.ncsa.illinois.edu/systems/delta/">NCSA
-Delta</a> (via <a href="https://access-ci.org/">NSF ACCESS</a>) for the GPU
-time.</i>
+Delta</a> (via <a href="https://access-ci.org/">NSF ACCESS</a>) for access to a
+variety of GPUs for testing.</i>
+
+## Training timelapse
+
+https://github.com/user-attachments/assets/f08892b7-67d4-47e7-bce7-1742386ef217
 
 ## Validation plot
 
