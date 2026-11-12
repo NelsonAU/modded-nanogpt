@@ -40,7 +40,7 @@ except ImportError:
     _get_kernel = None
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from triton_kernels import FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 from generation import _GEN_PROMPTS, print_samples
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
@@ -77,8 +77,7 @@ polar_express_coeffs = [
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                  split_baddbmm: bool = False):
+def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor):
     """
     Fused Nesterov momentum + Polar Express Sign Method.
     Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
@@ -100,60 +99,16 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
-    X = X.contiguous()
-
     if is_tall:
-        # Tall: use Triton kernels with X^T @ X (small) and right multiplication
-        A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
-        B = torch.empty_like(A)
-        C = torch.empty_like(X)
-
-        # Select batched vs unbatched
-        if split_baddbmm:
-            XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
-        else:
-            aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
-
-        # Perform the iterations
         for a, b, c in polar_express_coeffs:
-            XTX(X, out=A)  # A = X.T @ X
-            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)
-
-            # Referencing X twice causes pytorch to make a defensive copy,
-            # resulting in a cudaMemcpyAsync in baddbmm.
-            # For large matrices (i.e., the mlp weights), it's faster to split
-            # the operation into two kernels to avoid this.
-            if split_baddbmm:
-                XB_matmul(X, B, out=C)  # C = X @ B
-                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
-            else:
-                aX_plus_XB(X, X, B, beta=a, out=C)  # C = a * X + X @ B
-
-            X, C = C, X  # Swap references to avoid unnecessary copies
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
     else:
-        # Wide: use Triton kernels with X @ X^T (small) and left multiplication
-        A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
-        B = torch.empty_like(A)
-        C = torch.empty_like(X)
-
-        # Select batched vs unbatched
-        if split_baddbmm:
-            BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
-        else:
-            aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
-
-        # Perform the iterations
         for a, b, c in polar_express_coeffs:
-            XXT(X, out=A)  # A = X @ X.mT
-            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-
-            if split_baddbmm:
-                BX_matmul(B, X, out=C)  # C = B @ X
-                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
-            else:
-                aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
-
-            X, C = C, X  # Swap references to avoid unnecessary copies
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
 
     return X
 
@@ -781,10 +736,8 @@ class NorMuonAndAdam:
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Fused Nesterov momentum + Polar Express orthogonalization
-        is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(
             grad_chunk, p_state["momentum_buffer"], self._momentum_t,
-            split_baddbmm=is_large_matrix,
         )
 
         # Variance reduction

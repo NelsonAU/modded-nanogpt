@@ -51,6 +51,9 @@ Main changes from upstream:
 * For Ampere and Ada Lovelace architectures, add a mix of pure PyTorch
   fallbacks and BF16 Triton kernels in place of kernels that assume FP8, TMA,
   and/or sm90 inline assembly.
+* (Work in progress) Rip out the less impactful H100-specific speedrun
+  optimizations in favor of pure PyTorch code. Generally anything that
+  adds >100 lines of architecture-specific code for <3% speedup.
 * Choose validation batch size based on GPU VRAM (upstream setting is only
   suitable for 80GB+ cards).
 * Scale gradient accumulation steps based on GPU VRAM, which lets us support
