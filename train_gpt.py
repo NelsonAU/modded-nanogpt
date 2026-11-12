@@ -40,11 +40,15 @@ except ImportError:
     _get_kernel = None
 from torch import Tensor, nn
 
-from triton_kernels import FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from triton_kernels import FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, has_tma_support, transpose_add, transpose_copy
 from generation import _GEN_PROMPTS, print_samples
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+if has_tma_support():
+    ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+else:
+    def ReLUSqrdMLP(x: Tensor, W1: Tensor, W2: Tensor) -> Tensor:
+        return F.relu(F.linear(x, W1)).square() @ W2
 
 dynamo.config.recompile_limit = 64
 

@@ -102,13 +102,6 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 
 
 def linear_relu_square(a, b, aux=None):
-    if not has_tma_support():
-        c = a @ b.T
-        if aux is None: # forward pass
-            return c, torch.relu(c) ** 2
-        else:           # backward pass: aux is the saved raw output (pre)
-            return 2 * c * torch.relu(aux)
-
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
